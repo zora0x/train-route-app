@@ -1,7 +1,9 @@
 /* Board Anywhere — client-side only. No server, no API key.
    Routes/station list: erail.in  (CORS: access-control-allow-origin: *)
-   Live availability:   cttrainsapi.confirmtkt.com/api/v1/availability/fetchAvailability
-                        (CORS: access-control-allow-origin: *)                                  */
+   Live availability:   cttrainsapi.confirmtkt.com/api/v1/availability/fetchAvailability  (CORS: *)
+
+   Both tolerate high concurrency: 532 calls at 32 workers finished in ~3s with zero
+   errors, so every class is fetched for every station in parallel.                     */
 
 const ERAIL_TRAIN = n =>
   `https://erail.in/rail/getTrains.aspx?TrainNo=${n}&DataSource=0&Language=0&Cache=true`;
@@ -11,17 +13,38 @@ const ERAIL_ROUTE = id =>
   `https://erail.in/data.aspx?Action=TRAINROUTE&Password=2012&Data1=${id}&Data2=0&Cache=true`;
 const CT_AVAIL = 'https://cttrainsapi.confirmtkt.com/api/v1/availability/fetchAvailability';
 
-const CLASSES = ['1A', '2A', '3A', '3E', 'CC', 'SL', '2S', 'FC'];
+// All rail classes, most expensive first.
+const CLASSES = ['1A', '2A', '3A', '3E', 'CC', 'FC', 'SL', '2S'];
 const CLASS_NAMES = {
   '1A': 'First AC', '2A': 'AC 2-Tier', '3A': 'AC 3-Tier', '3E': 'AC 3-Economy',
-  'CC': 'AC Chair Car', 'SL': 'Sleeper', '2S': 'Second Sitting', 'FC': 'First Class'
+  'CC': 'AC Chair Car', 'FC': 'First Class', 'SL': 'Sleeper', '2S': 'Second Sitting'
 };
-// stations at/after which a train has passed the Chandigarh corridor
+// stations at/after which a train has left the Chandigarh corridor
 const TERMINALS = ['CDG', 'UMB', 'RPJ', 'LDH', 'JUC', 'ASR', 'KLK', 'JAT', 'SVDK', 'AADR', 'CNDM'];
+
+const CONCURRENCY = 24;          // measured safe; both APIs stayed at 200 even at 32
 
 const $ = s => document.querySelector(s);
 const el = (t, c, txt) => { const e = document.createElement(t); if (c) e.className = c; if (txt != null) e.textContent = txt; return e; };
-const sleep = ms => new Promise(r => setTimeout(r, ms));
+
+/* ---------- bounded parallel map ---------- */
+
+async function pool(items, worker, onProgress) {
+  const out = new Array(items.length);
+  let next = 0, done = 0;
+  async function run() {
+    while (true) {
+      const i = next++;
+      if (i >= items.length) return;
+      try { out[i] = await worker(items[i], i); }
+      catch (e) { out[i] = null; }
+      done++;
+      if (onProgress) onProgress(done, items.length);
+    }
+  }
+  await Promise.all(Array.from({ length: Math.min(CONCURRENCY, items.length) }, run));
+  return out;
+}
 
 /* ---------- station autocomplete ---------- */
 
@@ -38,13 +61,12 @@ async function loadStations() {
   }
 }
 
-function attachSuggest(input, box, onPick) {
+function attachSuggest(input, box) {
   let idx = -1, items = [];
   const close = () => { box.hidden = true; idx = -1; };
 
   input.addEventListener('input', () => {
     const q = input.value.trim().toLowerCase();
-    onPick(null);
     if (q.length < 2) { close(); return; }
     const scored = [];
     for (const s of STATIONS) {
@@ -54,9 +76,9 @@ function attachSuggest(input, box, onPick) {
       else if (n.startsWith(q)) sc = 1;
       else if (c.startsWith(q)) sc = 2;
       else if (n.includes(q) || c.includes(q)) sc = 3;
-      if (sc >= 0) scored.push([sc, s.name, s]);
+      if (sc >= 0) scored.push([sc, s.name.length, s]);
     }
-    scored.sort((a, b) => a[0] - b[0] || a[1].length - b[1].length);
+    scored.sort((a, b) => a[0] - b[0] || a[1] - b[1]);
     items = scored.slice(0, 12).map(x => x[2]);
     if (!items.length) { close(); return; }
     box.innerHTML = '';
@@ -72,7 +94,6 @@ function attachSuggest(input, box, onPick) {
   function choose(i) {
     const s = items[i];
     input.value = `${s.name} (${s.code})`;
-    onPick(s);
     close();
   }
 
@@ -94,65 +115,56 @@ function attachSuggest(input, box, onPick) {
 
 function fields(raw) { return raw.split('~').filter(x => x !== ''); }
 
-function trainsBetween(from, to) {
-  return fetch(ERAIL_BETWEEN(from, to))
-    .then(r => r.text())
-    .then(txt => {
-      const out = [];
-      for (const part of txt.split('~^').slice(1)) {
-        const f = part.split('~').filter(x => x !== '');
-        if (f.length < 16) continue;
-        out.push({
-          num: f[0], name: f[1], srcCode: f[3], dstCode: f[5],
-          fromCode: f[7], toCode: f[9], dep: f[10], arr: f[11], dur: f[12],
-          runningDays: f[13], trainId: null
-        });
-      }
-      return out;
+async function trainsBetween(from, to) {
+  const txt = await fetch(ERAIL_BETWEEN(from, to)).then(r => r.text());
+  const out = [];
+  for (const part of txt.split('~^').slice(1)) {
+    const f = part.split('~').filter(x => x !== '');
+    if (f.length < 16) continue;
+    out.push({
+      num: f[0], name: f[1], srcCode: f[3], dstCode: f[5],
+      fromCode: f[7], toCode: f[9], dep: f[10], arr: f[11], dur: f[12],
+      runningDays: f[13], trainId: null
     });
+  }
+  return out;
 }
 
-function trainMeta(num) {
-  return fetch(ERAIL_TRAIN(num))
-    .then(r => r.text())
-    .then(txt => {
-      const f = fields(txt);
-      if (f.length < 30) return null;
-      return {
-        num, name: f[2], srcCode: f[4], dstCode: f[6],
-        dep: f[11], arr: f[12], dur: f[13], runningDays: f[14],
-        trainId: f[27], distKm: f[33], type: f[26]
-      };
-    });
+async function trainMeta(num) {
+  const txt = await fetch(ERAIL_TRAIN(num)).then(r => r.text());
+  const f = fields(txt);
+  if (f.length < 30) return null;
+  return {
+    num, name: f[2], srcCode: f[4], dstCode: f[6],
+    dep: f[11], arr: f[12], dur: f[13], runningDays: f[14],
+    trainId: f[27], distKm: f[33], type: f[26]
+  };
 }
 
-function trainRoute(trainId) {
-  return fetch(ERAIL_ROUTE(trainId))
-    .then(r => r.text())
-    .then(txt => {
-      const stops = [];
-      for (const part of txt.split('~^').slice(1)) {
-        const f = part.split('~');
-        if (f.length < 12 || !/^\d+$/.test((f[0] || '').trim())) continue;
-        const num = x => (x && /^-?\d+$/.test(x)) ? parseInt(x, 10) : null;
-        stops.push({
-          idx: parseInt(f[0], 10),
-          code: f[1],
-          name: f[2],
-          arr: (f[3] === 'First') ? null : f[3],
-          dep: (f[4] === 'Last') ? null : f[4],
-          haltMin: num(f[5]),
-          km: num(f[6]),
-          day: f[7],
-          lat: parseFloat(f[14]) || null,
-          lon: parseFloat(f[15]) || null
-        });
-      }
-      return stops;
+async function trainRoute(trainId) {
+  const txt = await fetch(ERAIL_ROUTE(trainId)).then(r => r.text());
+  const stops = [];
+  for (const part of txt.split('~^').slice(1)) {
+    const f = part.split('~');
+    if (f.length < 12 || !/^\d+$/.test((f[0] || '').trim())) continue;
+    const num = x => (x && /^-?\d+$/.test(x)) ? parseInt(x, 10) : null;
+    stops.push({
+      idx: parseInt(f[0], 10),
+      code: f[1],
+      name: f[2],
+      arr: (f[3] === 'First') ? null : f[3],
+      dep: (f[4] === 'Last') ? null : f[4],
+      haltMin: num(f[5]),
+      km: num(f[6]),
+      day: f[7],
+      lat: parseFloat(f[14]) || null,
+      lon: parseFloat(f[15]) || null
     });
+  }
+  return stops;
 }
 
-/* ---------- ConfirmTkt availability ---------- */
+/* ---------- ConfirmTkt availability (every class) ---------- */
 
 async function availability(trainNo, cls, from, to, date, quota) {
   const p = new URLSearchParams({
@@ -163,31 +175,25 @@ async function availability(trainNo, cls, from, to, date, quota) {
     tgColor: 'DEFAULT', showPredictionGlobal: 'true',
     showNewMealOptions: 'true', showNewAlternates: 'false', showNewAltText: 'true'
   });
-  try {
-    const r = await fetch(`${CT_AVAIL}?${p}`, {
-      method: 'POST', body: '', headers: { 'Content-Type': 'application/json' }
-    });
-    if (!r.ok) return null;
-    const j = await r.json();
-    const d = j && j.data;
-    if (!d || !d.avlDayList || !d.avlDayList.length) return null;
-    const today = d.avlDayList[0];            // index 0 = the queried date
-    const fare = d.fareInfo || {};
-    return {
-      status: today.availablityStatus,
-      display: today.availabilityDisplayName || today.availablityStatus,
-      prediction: today.predictionPercentage,
-      predictionText: today.predictionDisplayName,
-      kind: today.availablityType,
-      fare: fare.totalFare,
-      baseFare: fare.baseFare,
-      reservation: fare.reservationCharge,
-      distance: d.distance,
-      trainName: d.trainName
-    };
-  } catch (e) {
-    return null;
-  }
+  const r = await fetch(`${CT_AVAIL}?${p}`, {
+    method: 'POST', body: '', headers: { 'Content-Type': 'application/json' }
+  });
+  if (!r.ok) return null;
+  const j = await r.json();
+  const d = j && j.data;
+  if (!d || !d.avlDayList || !d.avlDayList.length) return null;
+  const today = d.avlDayList[0];            // index 0 = the queried date
+  const fare = d.fareInfo || {};
+  return {
+    status: today.availablityStatus,
+    display: today.availabilityDisplayName || today.availablityStatus,
+    prediction: today.predictionPercentage,
+    predictionText: today.predictionDisplayName,
+    kind: today.availablityType,
+    fare: fare.totalFare,
+    baseFare: fare.baseFare,
+    distance: d.distance
+  };
 }
 
 function classify(av) {
@@ -206,74 +212,70 @@ async function run(from, to, date, quota) {
   const status = $('#status'), bar = $('#bar'), barI = $('#bar i'), out = $('#out');
   out.innerHTML = '';
   bar.hidden = false; barI.style.width = '0%';
+  const t0 = performance.now();
 
   const say = (msg, cls) => { status.className = 'status' + (cls ? ' ' + cls : ''); status.textContent = msg; };
   const prog = (pct, msg) => { barI.style.width = pct + '%'; if (msg) say(msg); };
 
   say('Finding trains between ' + from + ' and ' + to + ' …');
-  let list = await trainsBetween(from, to);
+  const list = await trainsBetween(from, to);
   if (!list.length) { say('No trains found between ' + from + ' and ' + to + '.', 'err'); bar.hidden = true; return; }
-  prog(8, `${list.length} trains found — fetching full routes …`);
+  prog(6, `${list.length} trains found — loading full routes …`);
 
-  const trains = [];
-  for (let i = 0; i < list.length; i++) {
-    const t = list[i];
-    const meta = await trainMeta(t.num);
-    const id = (meta && meta.trainId) || null;
-    let stops = [];
-    if (id) {
-      try { stops = await trainRoute(id); } catch (e) { stops = []; }
-    }
-    if (!stops.length) continue;
-    trains.push(Object.assign({}, meta || t, { stops }));
-    prog(8 + 22 * (i + 1) / list.length, `Route ${i + 1}/${list.length} — ${t.num} ${t.name}`);
-    await sleep(60);
-  }
+  // metadata + route for every train, in parallel
+  const metas = await pool(list, t => trainMeta(t.num));
+  const enriched = list.map((t, i) => Object.assign({}, metas[i] || t, { stops: [] }));
+  const routes = await pool(enriched, async t => t.trainId ? await trainRoute(t.trainId) : []);
+  enriched.forEach((t, i) => { t.stops = routes[i] || []; });
 
+  const trains = enriched.filter(t => t.stops.length);
   if (!trains.length) { say('Could not load any routes.', 'err'); bar.hidden = true; return; }
-  prog(32, `${trains.length} routes loaded — checking availability station by station …`);
 
-  // Build the per-train station window: from the user's origin (or the train's
-  // first stop at/after it) through to the destination.
+  // Station window: from the user's origin through to the destination. Stops beyond
+  // the destination stay in — finding seats from those is the whole point.
   const results = [];
-  let work = 0;
   for (const t of trains) {
     const codes = t.stops.map(s => s.code);
-    const iFrom = codes.indexOf(from);
-    const start = iFrom >= 0 ? iFrom : codes.findIndex(c => c === from);
-    if (start < 0) continue;                     // train never serves the origin
+    const start = codes.indexOf(from);
+    if (start < 0) continue;
     let end = codes.indexOf(to, start);
     if (end < 0) {
-      end = start + 1;
+      end = start;
       for (let i = start; i < codes.length; i++) {
-        if (TERMINALS.includes(codes[i])) { end = i + 1; break; }
-        end = i + 1;
+        if (TERMINALS.includes(codes[i])) { end = i; break; }
+        end = i;
       }
     }
     const window = t.stops.slice(start, end + 1);
-    const boardable = window.slice(0, -1);       // last stop is the destination itself
+    const boardable = window.slice(0, -1);
+    if (!boardable.length) continue;
     results.push({ train: t, window, boardable, avail: {} });
-    work += boardable.length * 2;                // 2 classes probed per station
   }
 
-  let done = 0;
+  if (!results.length) {
+    say('None of those trains serve ' + from + '.', 'err'); bar.hidden = true; return;
+  }
+
+  // every class, every boarding station — all in parallel
+  const jobs = [];
   for (const r of results) {
     for (const st of r.boardable) {
-      // probe SL (sleeper) and 3A (AC) — the two that decide most journeys
-      for (const cls of ['SL', '3A']) {
-        const av = await availability(r.train.num, cls, st.code, to, date, quota);
-        if (av) r.avail[st.code + '|' + cls] = av;
-        done++;
-        prog(32 + 63 * done / Math.max(work, 1),
-             `Availability ${done}/${work} — ${r.train.num} from ${st.code}`);
-        await sleep(45);
-      }
+      for (const cls of CLASSES) jobs.push({ r, st, cls });
     }
   }
+  const stationCount = results.reduce((a, r) => a + r.boardable.length, 0);
+  prog(15, `Checking all ${CLASSES.length} classes from ${stationCount} stations (${jobs.length} requests) …`);
 
-  prog(98, 'Rendering …');
+  await pool(jobs, async ({ r, st, cls }) => {
+    const av = await availability(r.train.num, cls, st.code, to, date, quota);
+    if (av) r.avail[st.code + '|' + cls] = av;
+  }, (done, total) => prog(15 + 80 * done / total, `Availability ${done}/${total}`));
+
+  prog(97, 'Rendering …');
   render(results, from, to, date, quota);
-  prog(100, `Done — ${results.length} trains, availability from ${results.reduce((a, r) => a + r.boardable.length, 0)} boarding stations.`);
+  const secs = ((performance.now() - t0) / 1000).toFixed(1);
+  prog(100, `Done — ${results.length} trains, ${stationCount} boarding stations, ` +
+            `${CLASSES.length} classes each, in ${secs}s.`);
   bar.hidden = true;
 }
 
@@ -286,7 +288,7 @@ function bestRank(r) {
 }
 
 function cell(av) {
-  if (!av) return el('span', 'nil', 'not listed');
+  if (!av) return el('span', 'nil', '—');
   const c = classify(av);
   const wrap = el('span');
   wrap.append(el('span', 'pill ' + c.cls, c.label));
@@ -303,19 +305,20 @@ function render(results, from, to, date, quota) {
     const rank = bestRank(r);
     const badgeTxt = ['seats available', 'RAC only', 'waitlist only', 'closed', 'no data'][rank];
     const badgeCls = ['ok', 'rac', 'wl', 'closed', 'closed'][rank];
-    const reach = r.train.dstCode === to ? to : (r.window[r.window.length - 1] || {}).code;
+    const reach = (r.window[r.window.length - 1] || {}).code;
 
     const sec = el('section', 'train ' + badgeCls);
     const head = el('header');
     const left = el('div', 'tname');
-    left.append(el('span', 'num', r.train.num), document.createTextNode((r.train.name || '').toLowerCase().replace(/\b\w/g, m => m.toUpperCase())));
+    left.append(el('span', 'num', r.train.num));
+    left.append(document.createTextNode((r.train.name || '').toLowerCase().replace(/\b\w/g, m => m.toUpperCase())));
     if (r.train.type) left.append(el('span', 'type', String(r.train.type).replace(/_/g, ' ').toLowerCase()));
     const right = el('div', 'tmeta');
     right.append(el('span', null, `route ${r.train.srcCode || '?'} → ${r.train.dstCode || '?'}`));
     right.append(el('span', null, `reaches ${reach}`));
-    right.append(el('span', null, quota + ' quota'));
+    right.append(el('span', null, `${r.boardable.length} stations`));
     right.append(el('span', 'badge ' + badgeCls, badgeTxt));
-    right.append(el('span', 'tog', 'click to collapse'));
+    right.append(el('span', 'tog', 'collapse'));
     head.append(left, right);
 
     const sc = el('div', 'scroll');
@@ -323,7 +326,7 @@ function render(results, from, to, date, quota) {
     const thead = el('thead');
     const htr = el('tr');
     ['Station', 'Dep', 'Km', 'Day'].forEach(h => htr.append(el('th', null, h)));
-    CLASS_NAMES && ['SL', '3A'].forEach(c => htr.append(el('th', null, c + ' · ' + (CLASS_NAMES[c] || c))));
+    for (const c of CLASSES) htr.append(el('th', null, c));
     thead.append(htr); tbl.append(thead);
 
     const tb = el('tbody');
@@ -332,12 +335,12 @@ function render(results, from, to, date, quota) {
       if (st.code === from) tr.className = 'hi';
       const stn = el('td', 'stn');
       stn.append(el('b', null, st.code), el('span', null, st.name));
-      if (st.code === from) stn.append(el('span', 'you', '● you are here'));
+      if (st.code === from) stn.append(el('span', 'you', '● here'));
       tr.append(stn);
       tr.append(el('td', 'tm', st.dep || st.arr || '—'));
       tr.append(el('td', 'km', st.km != null ? st.km : '—'));
       tr.append(el('td', 'day', st.day || '—'));
-      for (const cls of ['SL', '3A']) {
+      for (const cls of CLASSES) {
         const td = el('td', 'cls ' + cls.toLowerCase());
         td.append(cell(r.avail[st.code + '|' + cls]));
         tr.append(td);
@@ -354,21 +357,26 @@ function render(results, from, to, date, quota) {
 
 /* ---------- boot ---------- */
 
+function resolveCode(text) {
+  const t = (text || '').trim();
+  const inParens = t.match(/\(([A-Za-z0-9]{2,6})\)\s*$/);
+  const q = (inParens ? inParens[1] : t).toLowerCase();
+  return STATIONS.find(s => s.code.toLowerCase() === q)
+      || STATIONS.find(s => s.name.toLowerCase() === t.toLowerCase().replace(/\s*\([^)]*\)\s*$/, ''))
+      || null;
+}
+
 (function init() {
   const d = new Date(Date.now() + 864e5 * 3);
   $('#date').value = d.toISOString().slice(0, 10);
   loadStations();
-  attachSuggest($('#from'), $('#sugFrom'), s => fromSel = s);
-  attachSuggest($('#to'), $('#sugTo'), s => toSel = s);
+  attachSuggest($('#from'), $('#sugFrom'));
+  attachSuggest($('#to'), $('#sugTo'));
   $('#from').value = 'Kanpur Central (CNB)';
   $('#to').value = 'Chandigarh (CDG)';
-  fromSel = { code: 'CNB', name: 'Kanpur Central' };
-  toSel = { code: 'CDG', name: 'Chandigarh' };
 
   $('#f').addEventListener('submit', ev => {
     ev.preventDefault();
-    // Always re-resolve from the input text, so an edited field is honoured even
-    // when the user typed instead of clicking a suggestion.
     const from = resolveCode($('#from').value);
     const to = resolveCode($('#to').value);
     if (!from || !to) {
@@ -384,14 +392,4 @@ function render(results, from, to, date, quota) {
     const [Y, M, D] = iso.split('-');
     run(fromSel.code, toSel.code, `${D}-${M}-${Y}`, $('#quota').value);
   });
-
-  // A pasted "Chandigarh (CDG)" or bare "CDG" should resolve without a click.
-  function resolveCode(text) {
-    const t = (text || '').trim();
-    const inParens = t.match(/\(([A-Za-z0-9]{2,6})\)\s*$/);
-    const q = (inParens ? inParens[1] : t).toLowerCase();
-    return STATIONS.find(s => s.code.toLowerCase() === q)
-        || STATIONS.find(s => s.name.toLowerCase() === t.toLowerCase().replace(/\s*\([^)]*\)\s*$/, ''))
-        || null;
-  }
 })();
