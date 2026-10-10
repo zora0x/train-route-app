@@ -1,0 +1,148 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Board Anywhere — find seats from any station on the route</title>
+<style>
+:root{
+  --bg:#0d1117; --panel:#161b22; --panel2:#1c2330; --line:#2b3441;
+  --tx:#e6edf3; --dim:#8b949e; --acc:#58a6ff;
+  --ok:#238636; --rac:#9e6a03; --wl:#6e40c9; --reg:#6e7681; --err:#da3633;
+}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--tx);
+  font:14px/1.5 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif}
+.wrap{max-width:1400px;margin:0 auto;padding:24px 18px 70px}
+h1{font-size:21px;margin:0 0 4px}
+.sub{color:var(--dim);font-size:13px;margin-bottom:20px}
+.card{background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:18px}
+form{display:flex;gap:14px;flex-wrap:wrap;align-items:flex-end}
+.field{flex:1 1 210px;min-width:190px;position:relative}
+label{display:block;font-size:11px;text-transform:uppercase;letter-spacing:.07em;
+  color:var(--dim);margin-bottom:5px}
+input{width:100%;background:var(--panel2);border:1px solid var(--line);color:var(--tx);
+  padding:9px 11px;border-radius:7px;font-size:14px;outline:none}
+input:focus{border-color:var(--acc)}
+.sug{position:absolute;z-index:30;top:100%;left:0;right:0;background:#1b2230;
+  border:1px solid var(--acc);border-radius:0 0 7px 7px;max-height:270px;overflow-y:auto;
+  box-shadow:0 12px 28px rgba(0,0,0,.55)}
+.sug div{padding:7px 11px;cursor:pointer;font-size:13px;display:flex;justify-content:space-between;gap:10px}
+.sug div:hover,.sug div.sel{background:#243044}
+.sug code{color:var(--acc);font-size:11px}
+button{background:var(--acc);color:#04121f;border:0;padding:10px 22px;border-radius:7px;
+  font-size:14px;font-weight:600;cursor:pointer}
+button:disabled{opacity:.45;cursor:not-allowed}
+.status{margin:16px 0;font-size:13px;color:var(--dim);min-height:20px}
+.status.err{color:var(--err)}
+.bar{height:4px;background:var(--panel2);border-radius:3px;overflow:hidden;margin:10px 0}
+.bar>i{display:block;height:100%;background:var(--acc);width:0;transition:width .25s}
+.legend{display:flex;gap:14px;flex-wrap:wrap;align-items:center;font-size:12px;
+  background:var(--panel);border:1px solid var(--line);border-radius:8px;
+  padding:9px 14px;margin:18px 0;color:var(--dim)}
+.pill{display:inline-block;padding:1px 8px;border-radius:20px;font-size:11px;font-weight:600}
+.AVL{background:var(--ok);color:#fff}.RAC{background:var(--rac);color:#fff}
+.WL{background:var(--wl);color:#fff}.REG,.NIL{background:var(--reg);color:#fff}
+.train{background:var(--panel);border:1px solid var(--line);border-radius:10px;
+  margin-bottom:14px;overflow:hidden}
+.train.ok{border-left:3px solid var(--ok)}
+.train.rac{border-left:3px solid var(--rac)}
+.train.wl{border-left:3px solid var(--wl)}
+.train.closed{border-left:3px solid var(--reg);opacity:.85}
+header{display:flex;justify-content:space-between;align-items:center;gap:12px;flex-wrap:wrap;
+  padding:11px 15px;background:var(--panel2);border-bottom:1px solid var(--line);cursor:pointer}
+.tname{font-size:15px;font-weight:600}
+.num{color:var(--acc);font-variant-numeric:tabular-nums;margin-right:7px}
+.type{color:var(--dim);font-weight:400;font-size:12px;margin-left:8px}
+.tmeta{display:flex;gap:12px;align-items:center;font-size:12px;color:var(--dim);flex-wrap:wrap}
+.badge{padding:2px 9px;border-radius:20px;font-size:11px;font-weight:600}
+.badge.ok{background:var(--ok);color:#fff}.badge.rac{background:var(--rac);color:#fff}
+.badge.wl{background:var(--wl);color:#fff}.badge.closed{background:var(--reg);color:#fff}
+.scroll{overflow-x:auto}
+table{border-collapse:collapse;width:100%;font-size:12px}
+th{text-align:left;padding:8px 10px;color:var(--dim);font-weight:600;
+  border-bottom:1px solid var(--line);white-space:nowrap;background:var(--panel2);position:sticky;top:0}
+td{padding:7px 10px;border-bottom:1px solid #21262d;vertical-align:middle;white-space:nowrap}
+tr.hi td{background:#14301d}
+tr:hover td{background:#1a2130}
+.stn b{color:var(--tx)}
+.stn span{color:var(--dim);margin-left:7px;font-size:11px}
+.stn .you{color:var(--acc);font-size:10px;margin-left:6px}
+.tm,.km,.day{color:var(--dim);font-variant-numeric:tabular-nums}
+.cls{min-width:112px}
+.cn{color:var(--dim);font-size:10px;text-transform:uppercase;letter-spacing:.05em;margin-bottom:2px}
+.fare{color:var(--dim);font-size:11px;margin-left:6px;font-variant-numeric:tabular-nums}
+.chance{color:#d29922;font-size:11px;margin-left:5px}
+.nil{color:var(--reg);font-style:italic;font-size:11px}
+.empty{color:var(--reg);font-style:italic;text-align:center;padding:14px}
+details summary{cursor:pointer;list-style:none}
+details summary::-webkit-details-marker{display:none}
+.foot{color:var(--dim);font-size:12px;margin-top:26px;line-height:1.75}
+.foot b{color:var(--tx)}
+.collapsed .scroll,.collapsed tbody{display:none}
+.tog{color:var(--dim);font-size:11px}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>Board Anywhere</h1>
+  <div class="sub">Enter a journey. Every train on it is fetched with its <b>full route</b> — then seat
+    availability is checked from <b>each station on that route</b> to your destination.</div>
+
+  <div class="card">
+    <form id="f">
+      <div class="field">
+        <label for="from">From station</label>
+        <input id="from" autocomplete="off" placeholder="Kanpur Central">
+        <div class="sug" id="sugFrom" hidden></div>
+      </div>
+      <div class="field">
+        <label for="to">To station</label>
+        <input id="to" autocomplete="off" placeholder="Chandigarh">
+        <div class="sug" id="sugTo" hidden></div>
+      </div>
+      <div class="field" style="flex:0 1 165px">
+        <label for="date">Date of journey</label>
+        <input id="date" type="date">
+      </div>
+      <div class="field" style="flex:0 1 120px">
+        <label for="quota">Quota</label>
+        <select id="quota" style="width:100%;background:var(--panel2);border:1px solid var(--line);
+          color:var(--tx);padding:9px 11px;border-radius:7px;font-size:14px">
+          <option value="GN">General</option>
+          <option value="TQ">Tatkal</option>
+          <option value="PT">Premium Tatkal</option>
+          <option value="LD">Ladies</option>
+          <option value="SS">Senior Citizen</option>
+        </select>
+      </div>
+      <button id="go" type="submit">Find trains</button>
+    </form>
+    <div class="status" id="status"></div>
+    <div class="bar" id="bar" hidden><i></i></div>
+  </div>
+
+  <div class="legend">
+    <span class="pill AVL">AVL n</span> seats available
+    <span class="pill RAC">RAC n</span> against RAC
+    <span class="pill WL">WL n</span> waitlist
+    <span class="pill REG">Regret</span> closed
+    <span>%</span> confirmation chance
+    <span style="color:var(--acc)">● your boarding window</span>
+  </div>
+
+  <div id="out"></div>
+
+  <div class="foot">
+    <b>How to use it:</b> rows inside each train are <i>every</i> station that train stops at, not just
+    the ones between your two inputs. If a later station has open seats where yours doesn't, board
+    there instead — the fare drops and the waitlist often shortens.<br>
+    <b>Data:</b> routes and station list from erail.in; live availability and confirmation predictions
+    from ConfirmTkt. All fetched directly in your browser, no server and no API key.<br>
+    Availability changes constantly — this reflects the moment you searched.
+  </div>
+</div>
+
+<script src="app.js"></script>
+</body>
+</html>
