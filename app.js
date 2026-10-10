@@ -231,25 +231,27 @@ async function run(from, to, date, quota) {
   const trains = enriched.filter(t => t.stops.length);
   if (!trains.length) { say('Could not load any routes.', 'err'); bar.hidden = true; return; }
 
-  // Station window: from the user's origin through to the destination. Stops beyond
-  // the destination stay in — finding seats from those is the whole point.
+  // Boarding window: the train's ENTIRE route up to the destination, not just the
+  // part after your station. A seat freed up at an earlier stop is still bookable
+  // for the leg you actually ride — and that is exactly the seat you want.
   const results = [];
   for (const t of trains) {
     const codes = t.stops.map(s => s.code);
-    const start = codes.indexOf(from);
-    if (start < 0) continue;
-    let end = codes.indexOf(to, start);
+    const srcIdx = codes.indexOf(from);
+    if (srcIdx < 0) continue;              // train never serves your station
+    // End at the destination when the train reaches it; otherwise at the last
+    // station of the corridor (the train carries on past your destination).
+    let end = codes.indexOf(to, srcIdx);
     if (end < 0) {
-      end = start;
-      for (let i = start; i < codes.length; i++) {
+      end = codes.length - 1;
+      for (let i = 0; i < codes.length; i++) {
         if (TERMINALS.includes(codes[i])) { end = i; break; }
-        end = i;
       }
     }
-    const window = t.stops.slice(start, end + 1);
-    const boardable = window.slice(0, -1);
+    const window = t.stops.slice(0, end + 1);   // from the train's own origin
+    const boardable = window.slice(0, -1);      // the destination itself is not boardable
     if (!boardable.length) continue;
-    results.push({ train: t, window, boardable, avail: {} });
+    results.push({ train: t, window, boardable, srcIdx, avail: {} });
   }
 
   if (!results.length) {
@@ -316,7 +318,7 @@ function render(results, from, to, date, quota) {
     const right = el('div', 'tmeta');
     right.append(el('span', null, `route ${r.train.srcCode || '?'} → ${r.train.dstCode || '?'}`));
     right.append(el('span', null, `reaches ${reach}`));
-    right.append(el('span', null, `${r.boardable.length} stations`));
+    right.append(el('span', null, `${r.boardable.length} boarding stations`));
     right.append(el('span', 'badge ' + badgeCls, badgeTxt));
     right.append(el('span', 'tog', 'collapse'));
     head.append(left, right);
@@ -330,12 +332,16 @@ function render(results, from, to, date, quota) {
     thead.append(htr); tbl.append(thead);
 
     const tb = el('tbody');
-    for (const st of r.boardable) {
+    r.boardable.forEach((st, i) => {
       const tr = el('tr');
-      if (st.code === from) tr.className = 'hi';
+      const isYours = st.code === from;
+      const beforeYours = i < r.srcIdx;
+      if (isYours) tr.className = 'hi';
+      else if (beforeYours) tr.className = 'before';
       const stn = el('td', 'stn');
       stn.append(el('b', null, st.code), el('span', null, st.name));
-      if (st.code === from) stn.append(el('span', 'you', '● here'));
+      if (isYours) stn.append(el('span', 'you', '● your stop'));
+      else if (beforeYours) stn.append(el('span', 'pre', 'earlier'));
       tr.append(stn);
       tr.append(el('td', 'tm', st.dep || st.arr || '—'));
       tr.append(el('td', 'km', st.km != null ? st.km : '—'));
@@ -346,7 +352,7 @@ function render(results, from, to, date, quota) {
         tr.append(td);
       }
       tb.append(tr);
-    }
+    });
     tbl.append(tb); sc.append(tbl);
 
     head.onclick = () => sec.classList.toggle('collapsed');

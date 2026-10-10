@@ -64,10 +64,12 @@ th{text-align:left;padding:8px 10px;color:var(--dim);font-weight:600;
   border-bottom:1px solid var(--line);white-space:nowrap;background:var(--panel2);position:sticky;top:0}
 td{padding:7px 10px;border-bottom:1px solid #21262d;vertical-align:middle;white-space:nowrap}
 tr.hi td{background:#14301d}
+tr.before td{background:#161d2b}
 tr:hover td{background:#1a2130}
 .stn b{color:var(--tx)}
 .stn span{color:var(--dim);margin-left:7px;font-size:11px}
 .stn .you{color:var(--acc);font-size:10px;margin-left:6px}
+.stn .pre{color:var(--dim);font-size:10px;margin-left:6px;opacity:.75}
 .tm,.km,.day{color:var(--dim);font-variant-numeric:tabular-nums}
 .cls{min-width:96px}
 .cn{color:var(--dim);font-size:10px;text-transform:uppercase;letter-spacing:.05em;margin-bottom:2px}
@@ -87,7 +89,8 @@ details summary::-webkit-details-marker{display:none}
 <div class="wrap">
   <h1>Board Anywhere</h1>
   <div class="sub">Enter a journey. Every train on it is fetched with its <b>full route</b> — then seat
-    availability is checked from <b>each station on that route</b> to your destination.</div>
+    availability is checked from <b>each station on that route</b> to your destination, including
+    stations <i>before</i> where you board.</div>
 
   <div class="card">
     <form id="f">
@@ -128,17 +131,20 @@ details summary::-webkit-details-marker{display:none}
     <span class="pill WL">WL n</span> waitlist
     <span class="pill REG">Regret</span> closed
     <span>%</span> confirmation chance
-    <span style="color:var(--acc)">● your boarding window</span>
+    <span style="color:var(--acc)">● your stop</span>
+    <span style="color:var(--dim);opacity:.8">earlier</span> = boards before your station
   </div>
 
   <div id="out"></div>
 
   <div class="foot">
-    <b>How to use it:</b> rows inside each train are <i>every</i> station that train stops at, not just
-    the ones between your two inputs. If a later station has open seats where yours doesn't, board
-    there instead — the fare drops and the waitlist often shortens.<br>
-    <b>Data:</b> routes and station list from erail.in; live availability and confirmation predictions
-    from ConfirmTkt. All fetched directly in your browser, no server and no API key.<br>
+    <b>How to use it:</b> rows inside each train are <i>every</i> station that train stops at
+    from its own origin through to your destination — including the ones <i>before</i> your
+    station, marked <b>earlier</b>. A seat released at an earlier stop is still bookable for
+    the leg you actually ride, and that is often the seat that is open when yours is not.<br>
+    Boarding earlier costs more and adds waiting, so compare the fare column before you move.<br>
+    <b>Data:</b> routes and station list from erail.in; live availability and confirmation
+    predictions from ConfirmTkt. All fetched directly in your browser, no server and no API key.<br>
     Availability changes constantly — this reflects the moment you searched.
   </div>
 </div>
