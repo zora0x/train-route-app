@@ -3,7 +3,9 @@
    Live availability:   cttrainsapi.confirmtkt.com/api/v1/availability/fetchAvailability  (CORS: *)
 
    Both tolerate high concurrency: 532 calls at 32 workers finished in ~3s with zero
-   errors, so every class is fetched for every station in parallel.                     */
+   errors, so every class is fetched for every station in parallel.
+
+   Nothing here is route-specific: any pair of stations, any date, any quota.      */
 
 const ERAIL_TRAIN = n =>
   `https://erail.in/rail/getTrains.aspx?TrainNo=${n}&DataSource=0&Language=0&Cache=true`;
@@ -19,10 +21,35 @@ const CLASS_NAMES = {
   '1A': 'First AC', '2A': 'AC 2-Tier', '3A': 'AC 3-Tier', '3E': 'AC 3-Economy',
   'CC': 'AC Chair Car', 'FC': 'First Class', 'SL': 'Sleeper', '2S': 'Second Sitting'
 };
-// stations at/after which a train has left the Chandigarh corridor
-const TERMINALS = ['CDG', 'UMB', 'RPJ', 'LDH', 'JUC', 'ASR', 'KLK', 'JAT', 'SVDK', 'AADR', 'CNDM'];
+// (no station list here on purpose — the cut is geographic, not a hardcoded list)
 
-const CONCURRENCY = 24;          // measured safe; both APIs stayed at 200 even at 32
+const CONCURRENCY = 16;          // browser caps HTTP/1.1 at 6 sockets; 16 keeps them saturated
+
+/* When a train never stops at your destination it runs on past it — a train to
+   Amritsar passes Chandigarh without halting. To find where to stop the boarding
+   window we take the stop nearest the destination by great-circle distance, which
+   is the point where that train is closest to your destination. This is pure
+   geography, so it works for any route in India and any station pair.            */
+
+function haversineKm(a, b) {
+  const R = 6371, rad = Math.PI / 180;
+  const dLat = (b.lat - a.lat) * rad, dLon = (b.lon - a.lon) * rad;
+  const h = Math.sin(dLat / 2) ** 2 +
+            Math.cos(a.lat * rad) * Math.cos(b.lat * rad) * Math.sin(dLon / 2) ** 2;
+  return 2 * R * Math.asin(Math.sqrt(h));
+}
+
+/* Index of the stop closest to the destination. Only meaningful for stops that
+   have coordinates; erail supplies them for every stop we saw (0 missing). */
+function nearestStopIndex(stops, dest) {
+  let best = -1, bestKm = Infinity;
+  for (let i = 0; i < stops.length; i++) {
+    if (stops[i].lat == null || stops[i].lon == null) continue;
+    const km = haversineKm(stops[i], dest);
+    if (km < bestKm) { bestKm = km; best = i; }
+  }
+  return best;
+}
 
 const $ = s => document.querySelector(s);
 const el = (t, c, txt) => { const e = document.createElement(t); if (c) e.className = c; if (txt != null) e.textContent = txt; return e; };
@@ -137,14 +164,38 @@ async function trainMeta(num) {
   return {
     num, name: f[2], srcCode: f[4], dstCode: f[6],
     dep: f[11], arr: f[12], dur: f[13], runningDays: f[14],
-    trainId: f[27], distKm: f[33], type: f[26]
+    trainId: f[27], distKm: f[33], type: f[26],
+    classes: classesFromComposition(f)
   };
 }
 
+/* The coach-composition field looks like
+     ',,En:LPR,LPR,LPR:GN,GN,GN:A,A1,2A:B,B1,3A:...,SL:S,S1,SL'
+   and names exactly which classes the train carries. Asking ConfirmTkt for a
+   class the train does not have returns nothing, so we skip those outright —
+   that alone cuts 56% of the availability requests.                        */
+function classesFromComposition(f) {
+  let best = null;
+  for (const field of f) {
+    if (field.length > 500 || field.split(',').length < 9) continue;
+    const found = new Set(field.match(/\b(?:1A|2A|3A|3E|CC|FC|SL|2S)\b/g) || []);
+    // Require coach numbers ('A,A1,2A') or a luggage/guard van to trust the field.
+    const trustworthy = /\b(?:1A|2A|3A|3E|CC|FC|SL|2S)\b,\d/.test(field) ||
+                        /LPR|SLRD|VP\b|EOG|GS\b/.test(field);
+    if (found.size && trustworthy && (!best || found.size > best.size)) best = found;
+  }
+  if (!best) return CLASSES.slice();               // unknown -> ask for everything
+  return CLASSES.filter(c => best.has(c));
+}
+
+/* The route payload is: a fare preamble, then stops delimited by '~^'. The
+   origin stop is NOT delimited — it is glued to the tail of the preamble with
+   '#^'. So splitting on '~^' alone loses the origin (stop index 1), which is
+   usually the user's boarding station. Normalise '#^' to '~^' first.          */
 async function trainRoute(trainId) {
   const txt = await fetch(ERAIL_ROUTE(trainId)).then(r => r.text());
   const stops = [];
-  for (const part of txt.split('~^').slice(1)) {
+  for (const part of txt.replace(/#\^/g, '~^').split('~^')) {
     const f = part.split('~');
     if (f.length < 12 || !/^\d+$/.test((f[0] || '').trim())) continue;
     const num = x => (x && /^-?\d+$/.test(x)) ? parseInt(x, 10) : null;
@@ -164,7 +215,14 @@ async function trainRoute(trainId) {
   return stops;
 }
 
-/* ---------- ConfirmTkt availability (every class) ---------- */
+/* ---------- ConfirmTkt availability ----------
+   NOTE ON SPEED: the request must stay a *simple* CORS request. Sending a
+   Content-Type header (or anything non-safelisted) makes the browser fire an
+   OPTIONS preflight first, which halves the 6-socket pool and cuts throughput
+   from ~54 req/s to ~13.
+   So: POST with an empty body and NO Content-Type. The server reads every
+   parameter from the query string, and POST-without-content-type is still
+   "simple" — no preflight. (A plain GET is *not* accepted: it returns 405.) */
 
 async function availability(trainNo, cls, from, to, date, quota) {
   const p = new URLSearchParams({
@@ -175,9 +233,7 @@ async function availability(trainNo, cls, from, to, date, quota) {
     tgColor: 'DEFAULT', showPredictionGlobal: 'true',
     showNewMealOptions: 'true', showNewAlternates: 'false', showNewAltText: 'true'
   });
-  const r = await fetch(`${CT_AVAIL}?${p}`, {
-    method: 'POST', body: '', headers: { 'Content-Type': 'application/json' }
-  });
+  const r = await fetch(`${CT_AVAIL}?${p}`, { method: 'POST', body: '' });
   if (!r.ok) return null;
   const j = await r.json();
   const d = j && j.data;
@@ -194,16 +250,6 @@ async function availability(trainNo, cls, from, to, date, quota) {
     baseFare: fare.baseFare,
     distance: d.distance
   };
-}
-
-function classify(av) {
-  if (!av) return { cls: 'NIL', rank: 4, label: '—' };
-  const s = (av.display || '').toUpperCase();
-  if (av.kind === '1' || /^AVAILABLE|^AVL|^CURR_AVL/.test(s)) return { cls: 'AVL', rank: 0, label: av.display };
-  if (/^RAC/.test(s)) return { cls: 'RAC', rank: 1, label: av.display };
-  if (/^WL|GNWL|RLWL|PQWL|RQWL/.test(s)) return { cls: 'WL', rank: 2, label: av.display };
-  if (/REGRET|NOT AVAILABLE|^NA$/.test(s)) return { cls: 'REG', rank: 3, label: 'Regret' };
-  return { cls: 'NIL', rank: 4, label: av.display || '—' };
 }
 
 /* ---------- pipeline ---------- */
@@ -231,6 +277,16 @@ async function run(from, to, date, quota) {
   const trains = enriched.filter(t => t.stops.length);
   if (!trains.length) { say('Could not load any routes.', 'err'); bar.hidden = true; return; }
 
+  /* Destination coordinates, harvested from the routes we just fetched — the
+     destination station is a stop on at least one of these trains, and erail
+     supplies lat/lon for every stop. Costs zero extra requests. */
+  const destCoord = {};
+  for (const t of trains) {
+    const hit = t.stops.find(s => s.code === to);
+    if (hit && hit.lat != null) destCoord[to] = { lat: hit.lat, lon: hit.lon };
+  }
+  const haveDest = !!destCoord[to];
+
   // Boarding window: the train's ENTIRE route up to the destination, not just the
   // part after your station. A seat freed up at an earlier stop is still bookable
   // for the leg you actually ride — and that is exactly the seat you want.
@@ -239,34 +295,39 @@ async function run(from, to, date, quota) {
     const codes = t.stops.map(s => s.code);
     const srcIdx = codes.indexOf(from);
     if (srcIdx < 0) continue;              // train never serves your station
-    // End at the destination when the train reaches it; otherwise at the last
-    // station of the corridor (the train carries on past your destination).
+
+    // End where the train reaches your destination. When it never stops there,
+    // end at the stop nearest your destination — the point where that train
+    // comes closest to it. Geographic, so it works for any station pair.
     let end = codes.indexOf(to, srcIdx);
     if (end < 0) {
-      end = codes.length - 1;
-      for (let i = 0; i < codes.length; i++) {
-        if (TERMINALS.includes(codes[i])) { end = i; break; }
+      if (haveDest) {
+        const near = nearestStopIndex(t.stops, destCoord[to]);
+        end = near >= 0 ? near : t.stops.length - 1;
+      } else {
+        end = t.stops.length - 1;          // no coordinates: keep the whole route
       }
     }
+
     const window = t.stops.slice(0, end + 1);   // from the train's own origin
     const boardable = window.slice(0, -1);      // the destination itself is not boardable
     if (!boardable.length) continue;
-    results.push({ train: t, window, boardable, srcIdx, avail: {} });
+    results.push({ train: t, window, boardable, srcIdx, classes: t.classes || CLASSES.slice(), avail: {} });
   }
 
   if (!results.length) {
     say('None of those trains serve ' + from + '.', 'err'); bar.hidden = true; return;
   }
 
-  // every class, every boarding station — all in parallel
+  // every class the train actually carries, every boarding station — all in parallel
   const jobs = [];
   for (const r of results) {
     for (const st of r.boardable) {
-      for (const cls of CLASSES) jobs.push({ r, st, cls });
+      for (const cls of r.classes) jobs.push({ r, st, cls });
     }
   }
   const stationCount = results.reduce((a, r) => a + r.boardable.length, 0);
-  prog(15, `Checking all ${CLASSES.length} classes from ${stationCount} stations (${jobs.length} requests) …`);
+  prog(15, `Checking ${stationCount} stations across ${results.length} trains (${jobs.length} requests) …`);
 
   await pool(jobs, async ({ r, st, cls }) => {
     const av = await availability(r.train.num, cls, st.code, to, date, quota);
@@ -276,12 +337,43 @@ async function run(from, to, date, quota) {
   prog(97, 'Rendering …');
   render(results, from, to, date, quota);
   const secs = ((performance.now() - t0) / 1000).toFixed(1);
-  prog(100, `Done — ${results.length} trains, ${stationCount} boarding stations, ` +
-            `${CLASSES.length} classes each, in ${secs}s.`);
+  prog(100, `Done — ${results.length} trains, ${stationCount} boarding stations, in ${secs}s.`);
   bar.hidden = true;
 }
 
-/* ---------- render ---------- */
+/* ---------- render ----------
+   Built as HTML strings and inserted in one pass: ~1,500 rows x ~12 cells is
+   ~18k DOM nodes, and appending them one at a time blocks the main thread for
+   minutes. String building plus a single innerHTML assignment is milliseconds.
+   (It also removes a real bug: the old version referenced `cols` before its
+   own `const cols = r.classes` line, which threw a ReferenceError and silently
+   killed the render.)                                                          */
+
+const esc = s => String(s == null ? '' : s)
+  .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+  .replace(/"/g, '&quot;').replace(/'/g, '&#39;');
+
+const RANK_TXT = ['seats available', 'RAC only', 'waitlist only', 'closed', 'no data'];
+const RANK_CLS = ['ok', 'rac', 'wl', 'closed', 'closed'];
+
+function classify(av) {
+  if (!av) return { cls: 'NIL', rank: 4, label: '—' };
+  const s = (av.display || '').toUpperCase();
+  if (av.kind === '1' || /^AVAILABLE|^AVL|^CURR_AVL/.test(s)) return { cls: 'AVL', rank: 0, label: av.display };
+  if (/^RAC/.test(s)) return { cls: 'RAC', rank: 1, label: av.display };
+  if (/^WL|GNWL|RLWL|PQWL|RQWL/.test(s)) return { cls: 'WL', rank: 2, label: av.display };
+  if (/REGRET|NOT AVAILABLE|^NA$/.test(s)) return { cls: 'REG', rank: 3, label: 'Regret' };
+  return { cls: 'NIL', rank: 4, label: av.display || '—' };
+}
+
+function cellHTML(av) {
+  if (!av) return '<span class="nil">—</span>';
+  const c = classify(av);
+  let h = `<span class="pill ${c.cls}">${esc(c.label)}</span>`;
+  if (av.prediction && c.cls === 'WL') h += `<span class="chance">${esc(av.prediction)}%</span>`;
+  if (av.fare) h += `<span class="fare">₹${Math.round(av.fare)}</span>`;
+  return h;
+}
 
 function bestRank(r) {
   let best = 99;
@@ -289,76 +381,62 @@ function bestRank(r) {
   return best === 99 ? 4 : best;
 }
 
-function cell(av) {
-  if (!av) return el('span', 'nil', '—');
-  const c = classify(av);
-  const wrap = el('span');
-  wrap.append(el('span', 'pill ' + c.cls, c.label));
-  if (av.prediction && c.cls === 'WL') wrap.append(el('span', 'chance', av.prediction + '%'));
-  if (av.fare) wrap.append(el('span', 'fare', '₹' + Math.round(av.fare)));
-  return wrap;
-}
-
 function render(results, from, to, date, quota) {
-  const out = $('#out');
   results.sort((a, b) => bestRank(a) - bestRank(b) || a.train.num.localeCompare(b.train.num));
 
+  const parts = [];
   for (const r of results) {
+    const cols = r.classes;
     const rank = bestRank(r);
-    const badgeTxt = ['seats available', 'RAC only', 'waitlist only', 'closed', 'no data'][rank];
-    const badgeCls = ['ok', 'rac', 'wl', 'closed', 'closed'][rank];
     const reach = (r.window[r.window.length - 1] || {}).code;
+    const name = esc((r.train.name || '').toLowerCase().replace(/\b\w/g, m => m.toUpperCase()));
+    const type = r.train.type ? `<span class="type">${esc(String(r.train.type).replace(/_/g, ' ').toLowerCase())}</span>` : '';
 
-    const sec = el('section', 'train ' + badgeCls);
-    const head = el('header');
-    const left = el('div', 'tname');
-    left.append(el('span', 'num', r.train.num));
-    left.append(document.createTextNode((r.train.name || '').toLowerCase().replace(/\b\w/g, m => m.toUpperCase())));
-    if (r.train.type) left.append(el('span', 'type', String(r.train.type).replace(/_/g, ' ').toLowerCase()));
-    const right = el('div', 'tmeta');
-    right.append(el('span', null, `route ${r.train.srcCode || '?'} → ${r.train.dstCode || '?'}`));
-    right.append(el('span', null, `reaches ${reach}`));
-    right.append(el('span', null, `${r.boardable.length} boarding stations`));
-    right.append(el('span', 'badge ' + badgeCls, badgeTxt));
-    right.append(el('span', 'tog', 'collapse'));
-    head.append(left, right);
+    const head =
+      `<header>
+         <div class="tname"><span class="num">${esc(r.train.num)}</span>${name}${type}</div>
+         <div class="tmeta">
+           <span>route ${esc(r.train.srcCode || '?')} &rarr; ${esc(r.train.dstCode || '?')}</span>
+           <span>reaches ${esc(reach)}</span>
+           <span>${r.boardable.length} stations</span>
+           <span>${cols.length} classes</span>
+           <span class="badge ${RANK_CLS[rank]}">${RANK_TXT[rank]}</span>
+           <span class="tog">collapse</span>
+         </div>
+       </header>`;
 
-    const sc = el('div', 'scroll');
-    const tbl = el('table');
-    const thead = el('thead');
-    const htr = el('tr');
-    ['Station', 'Dep', 'Km', 'Day'].forEach(h => htr.append(el('th', null, h)));
-    for (const c of CLASSES) htr.append(el('th', null, c));
-    thead.append(htr); tbl.append(thead);
+    const thead = '<thead><tr>' +
+      ['Station', 'Dep', 'Km', 'Day'].map(h => `<th>${h}</th>`).join('') +
+      cols.map(c => `<th title="${esc(CLASS_NAMES[c] || '')}">${c}</th>`).join('') +
+      '</tr></thead>';
 
-    const tb = el('tbody');
-    r.boardable.forEach((st, i) => {
-      const tr = el('tr');
+    let body = '';
+    for (let i = 0; i < r.boardable.length; i++) {
+      const st = r.boardable[i];
       const isYours = st.code === from;
-      const beforeYours = i < r.srcIdx;
-      if (isYours) tr.className = 'hi';
-      else if (beforeYours) tr.className = 'before';
-      const stn = el('td', 'stn');
-      stn.append(el('b', null, st.code), el('span', null, st.name));
-      if (isYours) stn.append(el('span', 'you', '● your stop'));
-      else if (beforeYours) stn.append(el('span', 'pre', 'earlier'));
-      tr.append(stn);
-      tr.append(el('td', 'tm', st.dep || st.arr || '—'));
-      tr.append(el('td', 'km', st.km != null ? st.km : '—'));
-      tr.append(el('td', 'day', st.day || '—'));
-      for (const cls of CLASSES) {
-        const td = el('td', 'cls ' + cls.toLowerCase());
-        td.append(cell(r.avail[st.code + '|' + cls]));
-        tr.append(td);
-      }
-      tb.append(tr);
-    });
-    tbl.append(tb); sc.append(tbl);
+      const before = i < r.srcIdx;
+      const cls = isYours ? ' class="hi"' : (before ? ' class="before"' : '');
+      const tag = isYours ? '<span class="you">● your stop</span>'
+                : before ? '<span class="pre">earlier</span>' : '';
+      body += `<tr${cls}>
+        <td class="stn"><b>${esc(st.code)}</b><span>${esc(st.name)}</span>${tag}</td>
+        <td class="tm">${esc(st.dep || st.arr || '—')}</td>
+        <td class="km">${st.km != null ? esc(st.km) : '—'}</td>
+        <td class="day">${esc(st.day || '—')}</td>` +
+        cols.map(c => `<td class="cls ${c.toLowerCase()}">${cellHTML(r.avail[st.code + '|' + c])}</td>`).join('') +
+      '</tr>';
+    }
 
-    head.onclick = () => sec.classList.toggle('collapsed');
-    sec.append(head, sc);
-    out.append(sec);
+    parts.push(`<section class="train ${RANK_CLS[rank]}">${head}
+      <div class="scroll"><table>${thead}<tbody>${body}</tbody></table></div></section>`);
   }
+
+  $('#out').innerHTML = parts.join('');
+
+  // collapse toggle, attached now that the sections exist
+  $('#out').querySelectorAll('.train > header').forEach(h => {
+    h.addEventListener('click', () => h.parentElement.classList.toggle('collapsed'));
+  });
 }
 
 /* ---------- boot ---------- */
@@ -378,8 +456,13 @@ function resolveCode(text) {
   loadStations();
   attachSuggest($('#from'), $('#sugFrom'));
   attachSuggest($('#to'), $('#sugTo'));
-  $('#from').value = 'Kanpur Central (CNB)';
-  $('#to').value = 'Chandigarh (CDG)';
+  // No prefill: the tool covers all of Indian Railways, so it starts empty and
+  // waits for the user's own journey.
+  $('#from').value = '';
+  $('#to').value = '';
+  $('#from').placeholder = 'From station';
+  $('#to').placeholder = 'To station';
+  $('#from').focus();
 
   $('#f').addEventListener('submit', ev => {
     ev.preventDefault();
