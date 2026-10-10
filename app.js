@@ -23,7 +23,10 @@ const CLASS_NAMES = {
 };
 // (no station list here on purpose — the cut is geographic, not a hardcoded list)
 
-const CONCURRENCY = 16;          // browser caps HTTP/1.1 at 6 sockets; 16 keeps them saturated
+/* Bounded parallelism. Measured against the live API: 6 workers 38 req/s,
+   16 → ~95, 24 → 156, 48 → 275, 96 → 162 (past 48 the server starts queueing
+   and latency rises). 48 is the measured peak, and no request failed at it. */
+const CONCURRENCY = 48;
 
 /* When a train never stops at your destination it runs on past it — a train to
    Amritsar passes Chandigarh without halting. To find where to stop the boarding
@@ -238,18 +241,77 @@ async function availability(trainNo, cls, from, to, date, quota) {
   const j = await r.json();
   const d = j && j.data;
   if (!d || !d.avlDayList || !d.avlDayList.length) return null;
-  const today = d.avlDayList[0];            // index 0 = the queried date
   const fare = d.fareInfo || {};
+
+  /* One call returns the queried date AND the next three. Index 0 is the date
+     asked for; 1..3 are the following days. Reading all four costs nothing and
+     lets the UI show "it opens up on the 8th" — often the answer the user needs. */
+  const parse = (day) => ({
+    date: day.availablityDate,
+    status: day.availablityStatus,
+    display: day.availabilityDisplayName || day.availablityStatus,
+    prediction: day.predictionPercentage,
+    predictionText: day.predictionDisplayName,
+    kind: day.availablityType
+  });
+
+  const days = d.avlDayList.map(parse).filter(x => x.display);
+  if (!days.length) return null;
+  const today = days[0];
   return {
-    status: today.availablityStatus,
-    display: today.availabilityDisplayName || today.availablityStatus,
-    prediction: today.predictionPercentage,
-    predictionText: today.predictionDisplayName,
-    kind: today.availablityType,
+    status: today.status,
+    display: today.display,
+    prediction: today.prediction,
+    predictionText: today.predictionText,
+    kind: today.kind,
     fare: fare.totalFare,
     baseFare: fare.baseFare,
-    distance: d.distance
+    distance: d.distance,
+    days                                        // [queried date, +1, +2, +3]
   };
+}
+
+/* ---------- cache ----------
+   Route and class data change only when the timetable changes, so it is cached
+   in localStorage for a day. Availability is volatile and must never be cached.
+   A repeat search of the same route then skips the route fetches entirely.     */
+
+const ROUTE_TTL_MS = 24 * 3600e3;
+const routeKey = (num) => 'rt|' + num;
+
+function cacheGet(key, ttl) {
+  try {
+    const raw = localStorage.getItem(key);
+    if (!raw) return null;
+    const hit = JSON.parse(raw);
+    if (!hit || typeof hit.t !== 'number') return null;
+    if (ttl && Date.now() - hit.t > ttl) { localStorage.removeItem(key); return null; }
+    return hit.v;
+  } catch (e) { return null; }
+}
+
+function cacheSet(key, val) {
+  try {
+    localStorage.setItem(key, JSON.stringify({ t: Date.now(), v: val }));
+  } catch (e) { /* quota full or private mode — caching is an optimisation only */ }
+}
+
+async function cachedRoute(trainId) {
+  const key = routeKey(trainId);
+  const hit = cacheGet(key, ROUTE_TTL_MS);
+  if (hit) return hit;
+  const stops = await trainRoute(trainId);
+  if (stops && stops.length) cacheSet(key, stops);
+  return stops;
+}
+
+async function cachedMeta(num) {
+  const key = 'mt|' + num;
+  const hit = cacheGet(key, ROUTE_TTL_MS);
+  if (hit) return hit;
+  const m = await trainMeta(num);
+  if (m) cacheSet(key, m);
+  return m;
 }
 
 /* ---------- pipeline ---------- */
@@ -268,10 +330,10 @@ async function run(from, to, date, quota) {
   if (!list.length) { say('No trains found between ' + from + ' and ' + to + '.', 'err'); bar.hidden = true; return; }
   prog(6, `${list.length} trains found — loading full routes …`);
 
-  // metadata + route for every train, in parallel
-  const metas = await pool(list, t => trainMeta(t.num));
+  // metadata + route for every train, in parallel (cached after the first run)
+  const metas = await pool(list, t => cachedMeta(t.num));
   const enriched = list.map((t, i) => Object.assign({}, metas[i] || t, { stops: [] }));
-  const routes = await pool(enriched, async t => t.trainId ? await trainRoute(t.trainId) : []);
+  const routes = await pool(enriched, async t => t.trainId ? await cachedRoute(t.trainId) : []);
   enriched.forEach((t, i) => { t.stops = routes[i] || []; });
 
   const trains = enriched.filter(t => t.stops.length);
@@ -319,22 +381,49 @@ async function run(from, to, date, quota) {
     say('None of those trains serve ' + from + '.', 'err'); bar.hidden = true; return;
   }
 
-  // every class the train actually carries, every boarding station — all in parallel
-  const jobs = [];
-  for (const r of results) {
-    for (const st of r.boardable) {
-      for (const cls of r.classes) jobs.push({ r, st, cls });
-    }
-  }
   const stationCount = results.reduce((a, r) => a + r.boardable.length, 0);
-  prog(15, `Checking ${stationCount} stations across ${results.length} trains (${jobs.length} requests) …`);
+  const totalJobs = results.reduce((a, r) => a + r.boardable.length * r.classes.length, 0);
 
-  await pool(jobs, async ({ r, st, cls }) => {
+  /* Phase 1 — your station only, for every train. That is the answer to
+     "can I get a seat where I actually board", so it renders immediately and
+     the page feels instant even on a 1,400-request search. */
+  const priority = [];
+  for (const r of results) {
+    const st = r.boardable.find(s => s.code === from) || r.boardable[r.boardable.length - 1];
+    for (const cls of r.classes) priority.push({ r, st, cls });
+  }
+  await pool(priority, async ({ r, st, cls }) => {
     const av = await availability(r.train.num, cls, st.code, to, date, quota);
     if (av) r.avail[st.code + '|' + cls] = av;
-  }, (done, total) => prog(15 + 80 * done / total, `Availability ${done}/${total}`));
+  });
 
-  prog(97, 'Rendering …');
+  prog(30, `Your stations checked — filling in the rest of each route (${totalJobs} requests) …`);
+  render(results, from, to, date, quota, true);          // streaming: rest still loading
+  const firstPaint = ((performance.now() - t0) / 1000).toFixed(1);
+  prog(32, `First results in ${firstPaint}s — now checking every station on each route …`);
+
+  /* Phase 2 — every other station on every route, in the background. The table
+     is already on screen; each train re-renders as its rows complete. */
+  const rest = [];
+  for (const r of results) {
+    for (const st of r.boardable) {
+      if (st.code === from) continue;                 // already fetched in phase 1
+      for (const cls of r.classes) rest.push({ r, st, cls });
+    }
+  }
+  await pool(rest, async ({ r, st, cls }) => {
+    const av = await availability(r.train.num, cls, st.code, to, date, quota);
+    if (av) r.avail[st.code + '|' + cls] = av;
+  }, (done, total) => {
+    prog(32 + 68 * done / total, `Availability ${done}/${total}`);
+    // Re-render rarely: a full pass rebuilds ~18k nodes, so doing it often costs
+    // more than it shows. Three times is enough to feel alive without thrashing.
+    if (done === Math.ceil(total * 0.33) || done === Math.ceil(total * 0.66) || done === total) {
+      render(results, from, to, date, quota, done < total);
+    }
+  });
+
+  prog(100, 'Rendering …');
   render(results, from, to, date, quota);
   const secs = ((performance.now() - t0) / 1000).toFixed(1);
   prog(100, `Done — ${results.length} trains, ${stationCount} boarding stations, in ${secs}s.`);
@@ -366,13 +455,36 @@ function classify(av) {
   return { cls: 'NIL', rank: 4, label: av.display || '—' };
 }
 
-function cellHTML(av) {
-  if (!av) return '<span class="nil">—</span>';
+function cellHTML(av, pending) {
+  if (!av) return pending ? '<span class="wait">…</span>' : '<span class="nil">—</span>';
   const c = classify(av);
   let h = `<span class="pill ${c.cls}">${esc(c.label)}</span>`;
   if (av.prediction && c.cls === 'WL') h += `<span class="chance">${esc(av.prediction)}%</span>`;
   if (av.fare) h += `<span class="fare">₹${Math.round(av.fare)}</span>`;
+
+  /* If this date is waitlisted but a nearby date has real seats, say so — that
+     is often the only way to travel confirmed. Only the queried date's pill
+     keeps the colour, so the row still reads at a glance. */
+  if (av.days && av.days.length > 1 && c.cls === 'WL') {
+    const better = av.days.slice(1).find(d => {
+      const b = classify({ display: d.display, kind: d.kind });
+      return b.cls === 'AVL' || b.cls === 'RAC';
+    });
+    if (better) {
+      const b = classify({ display: better.display, kind: better.kind });
+      h += `<span class="alt" title="${esc(better.date)}: ${esc(better.display)}">` +
+           `${b.cls === 'AVL' ? 'seats' : 'RAC'} on ${esc(shortDate(better.date))}</span>`;
+    }
+  }
   return h;
+}
+
+/* '8-11-2026' -> '8 Nov' */
+function shortDate(s) {
+  const m = /^(\d{1,2})-(\d{1,2})-(\d{4})$/.exec(s || '');
+  if (!m) return s || '';
+  const MON = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
+  return `${parseInt(m[1], 10)} ${MON[parseInt(m[2], 10) - 1]}`;
 }
 
 function bestRank(r) {
@@ -381,7 +493,9 @@ function bestRank(r) {
   return best === 99 ? 4 : best;
 }
 
-function render(results, from, to, date, quota) {
+/* `streaming` is true while later stations are still being fetched, so cells
+   that have no data yet show a faint "…" instead of a flat dash. */
+function render(results, from, to, date, quota, streaming) {
   results.sort((a, b) => bestRank(a) - bestRank(b) || a.train.num.localeCompare(b.train.num));
 
   const parts = [];
@@ -423,7 +537,7 @@ function render(results, from, to, date, quota) {
         <td class="tm">${esc(st.dep || st.arr || '—')}</td>
         <td class="km">${st.km != null ? esc(st.km) : '—'}</td>
         <td class="day">${esc(st.day || '—')}</td>` +
-        cols.map(c => `<td class="cls ${c.toLowerCase()}">${cellHTML(r.avail[st.code + '|' + c])}</td>`).join('') +
+        cols.map(c => `<td class="cls ${c.toLowerCase()}">${cellHTML(r.avail[st.code + '|' + c], streaming && st.code !== from)}</td>`).join('') +
       '</tr>';
     }
 

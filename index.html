@@ -75,7 +75,10 @@ tr:hover td{background:#1a2130}
 .cn{color:var(--dim);font-size:10px;text-transform:uppercase;letter-spacing:.05em;margin-bottom:2px}
 .fare{color:var(--dim);font-size:11px;margin-left:6px;font-variant-numeric:tabular-nums}
 .chance{color:#d29922;font-size:11px;margin-left:5px}
-.nil{color:var(--reg);font-style:italic;font-size:11px}
+.nil{color:var(--dim);opacity:.5}
+.wait{color:var(--dim);opacity:.6;animation:pulse 1.1s ease-in-out infinite}
+.alt{color:#58a6ff;font-size:10px;margin-left:6px;background:#12233a;border:1px solid #1f3a5f;padding:1px 5px;border-radius:4px;cursor:help}
+@keyframes pulse{0%,100%{opacity:.3}50%{opacity:.85}}
 .empty{color:var(--reg);font-style:italic;text-align:center;padding:14px}
 details summary{cursor:pointer;list-style:none}
 details summary::-webkit-details-marker{display:none}
@@ -131,6 +134,7 @@ details summary::-webkit-details-marker{display:none}
     <span class="pill WL">WL n</span> waitlist
     <span class="pill REG">Regret</span> closed
     <span>%</span> confirmation chance
+    <span class="alt" style="font-size:10px">seats on 8 Nov</span> that date opens up
     <span style="color:var(--acc)">● your stop</span>
     <span style="color:var(--dim);opacity:.8">earlier</span> = boards before your station
   </div>
